@@ -1,7 +1,7 @@
 import pandas as pd
 
 from src.database import get_connection
-from src.llm_client import ask_llm
+from src.llm_client import answer_with_llm
 from src.ml_expense_prediction import get_prediction
 from src.anomaly_detection import get_anomalies
 
@@ -1198,16 +1198,12 @@ def answer_question(question):
         return local_answer
 
     # --------------------------------------------------------
-    # LLM FALLBACK
-    # --------------------------------------------------------
+     # LLM FALLBACK
+    # ---------------------------------------------
 
-    prompt = build_llm_prompt(
+    return answer_with_llm(
         question,
-        context
-    )
-
-    return ask_llm(
-        prompt
+        df
     )
 
 

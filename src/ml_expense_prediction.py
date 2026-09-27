@@ -1,14 +1,11 @@
 import pandas as pd
-import sqlite3
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-
-
-DB_PATH = "data/finance.db"
+from src.database import get_connection
 
 
 def get_expense_data():
-    connection = sqlite3.connect(DB_PATH)
+    connection = get_connection()
 
     query = """
     SELECT date, amount

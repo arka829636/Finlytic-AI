@@ -1,20 +1,188 @@
 import streamlit as st
 import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
+
 from src.database import (
     get_user_connection,
     initialize_user_database,
     set_current_user,
     clear_current_user,
 )
+from src.auth import init_auth_db, register_user, authenticate_user
 from src.finance_chat import answer_question as module_answer_question
-from src.llm_client import answer_with_llm
-from src.auth import (
-    init_auth_db,
-    register_user,
-    authenticate_user,
-    create_password_reset_code,
-    reset_password,
-)
+from src.ml_expense_prediction import get_prediction
+from src.anomaly_detection import get_anomalies
+
+
+# ============================================================
+# AUTHENTICATION INITIALIZATION
+# ============================================================
+
+init_auth_db()
+
+
+def rebalance_demo_expenses_once():
+    """One-time demo-data adjustment so recorded expenses are below income.
+
+    This preserves every transaction, category, date, description and payment method;
+    it only scales existing expense amounts so the current demo totals produce a
+    positive savings position. A database marker prevents the adjustment from
+    running again on every Streamlit rerun.
+    """
+    target_expenses = 102714.10
+    connection = get_connection()
+    try:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+
+        already_done = connection.execute(
+            "SELECT value FROM app_meta WHERE key = ?",
+            ("positive_demo_expenses_v1",),
+        ).fetchone()
+
+        if already_done:
+            return
+
+        current_total = connection.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE LOWER(type) = 'expense'"
+        ).fetchone()[0]
+
+        if current_total <= target_expenses:
+            connection.execute(
+                "INSERT INTO app_meta (key, value) VALUES (?, ?)",
+                ("positive_demo_expenses_v1", "not_needed"),
+            )
+            connection.commit()
+            return
+
+        factor = target_expenses / float(current_total)
+        connection.execute(
+            """
+            UPDATE transactions
+            SET amount = ROUND(amount * ?, 2)
+            WHERE LOWER(type) = 'expense'
+            """,
+            (factor,),
+        )
+
+        # Correct rounding drift so the total is exactly the target amount.
+        new_total = connection.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE LOWER(type) = 'expense'"
+        ).fetchone()[0]
+        difference = round(target_expenses - float(new_total), 2)
+
+        if difference != 0:
+            last_expense = connection.execute(
+                """
+                SELECT id FROM transactions
+                WHERE LOWER(type) = 'expense'
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if last_expense:
+                connection.execute(
+                    "UPDATE transactions SET amount = ROUND(amount + ?, 2) WHERE id = ?",
+                    (difference, last_expense[0]),
+                )
+
+        connection.execute(
+            "INSERT INTO app_meta (key, value) VALUES (?, ?)",
+            ("positive_demo_expenses_v1", f"adjusted_to_{target_expenses:.2f}"),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+
+def distribute_demo_income_across_months_once():
+    """Spread the existing demo income across May-September 2026 once.
+
+    The total income is preserved; only the timing and descriptions of the
+    demo income records are changed so monthly analysis shows income in each
+    month from May through September.
+    """
+    connection = get_connection()
+    marker_key = "demo_income_may_sep_v1"
+    try:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+
+        if connection.execute(
+            "SELECT 1 FROM app_meta WHERE key = ?", (marker_key,)
+        ).fetchone():
+            return
+
+        rows = connection.execute(
+            "SELECT id, date, amount FROM transactions WHERE LOWER(type) = 'income' ORDER BY id"
+        ).fetchall()
+
+        if not rows:
+            return
+
+        total_income = round(sum(float(row[2]) for row in rows), 2)
+        if total_income <= 0:
+            return
+
+        # Preserve the current total income exactly while distributing it.
+        target_amounts = [20000.00, 23000.00, 25000.00, 32000.00, 30000.00]
+        target_total = round(sum(target_amounts), 2)
+        scale = total_income / target_total
+        target_amounts = [round(value * scale, 2) for value in target_amounts]
+        target_amounts[-1] = round(total_income - sum(target_amounts[:-1]), 2)
+
+        months = [
+            ("2026-05-15", "May Salary"),
+            ("2026-06-15", "June Salary"),
+            ("2026-07-15", "July Salary"),
+            ("2026-08-15", "August Salary"),
+            ("2026-09-15", "September Salary"),
+        ]
+
+        # Use the first existing income row for May and remove the remaining
+        # income rows; then create the five monthly demo income records.
+        connection.execute(
+            "DELETE FROM transactions WHERE LOWER(type) = 'income'"
+        )
+
+        for (date_value, description), amount in zip(months, target_amounts):
+            connection.execute(
+                """
+                INSERT INTO transactions
+                (date, type, category, description, amount, payment_method)
+                VALUES (?, 'Income', 'Salary', ?, ?, 'Bank Transfer')
+                """,
+                (date_value, description, amount),
+            )
+
+        connection.execute(
+            "INSERT INTO app_meta (key, value) VALUES (?, ?)",
+            (marker_key, f"distributed_total_{total_income:.2f}"),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
 
 # ============================================================
 # PAGE CONFIGURATION
@@ -593,12 +761,9 @@ button[kind="secondary"]:hover {
 )
 
 
-
 # ============================================================
-# AUTHENTICATION
+# AUTHENTICATION GATE
 # ============================================================
-
-init_auth_db()
 
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
@@ -615,18 +780,13 @@ def show_authentication():
         """
         <div style="max-width:620px;margin:50px auto 25px;text-align:center;">
             <div style="font-size:42px;">💰</div>
-            <h1 style="margin-bottom:5px;">
-                Finance<span style="color:#10B981;">AI</span>
-            </h1>
+            <h1 style="margin-bottom:5px;">Finance<span style="color:#10B981;">AI</span></h1>
             <p style="color:#9CA3AF;">Personal Finance Command Center</p>
         </div>
-        """,
-        unsafe_allow_html=True,
+        """, unsafe_allow_html=True
     )
 
-    login_tab, register_tab, forgot_tab = st.tabs(
-        ["🔐 Login", "📝 Register", "🔑 Forgot Password"]
-    )
+    login_tab, register_tab = st.tabs(["🔐 Login", "📝 Create Account"])
 
     with login_tab:
         st.markdown("### Welcome back")
@@ -647,7 +807,6 @@ def show_authentication():
                     st.session_state.user_email = result["email"]
                     st.session_state.chat_history = []
                     initialize_user_database(result["user_id"], load_demo=True)
-                    set_current_user(result["user_id"])
                     st.rerun()
                 else:
                     st.error(result.get("message", "Invalid email or password."))
@@ -672,108 +831,10 @@ def show_authentication():
                 else:
                     st.error(message)
 
-    with forgot_tab:
-        st.markdown("### 🔑 Reset your password")
-        st.info("Enter your registered email address to generate a password reset code.")
-
-        reset_email = st.text_input(
-            "Registered Email",
-            placeholder="you@example.com",
-            key="forgot_email",
-        )
-
-        if st.button(
-            "📩 Generate Reset Code",
-            key="generate_reset_code",
-            use_container_width=True,
-        ):
-            success, message, reset_code = create_password_reset_code(reset_email)
-
-            if success:
-                st.session_state.reset_email = reset_email.strip().lower()
-                st.session_state.reset_code_generated = True
-                st.session_state.dev_reset_code = reset_code
-                st.success("Reset code generated successfully.")
-                st.warning(f"🔐 Development Reset Code: {reset_code}")
-            else:
-                st.error(message)
-
-        if st.session_state.get("reset_code_generated", False):
-            st.divider()
-            st.markdown("### Create a new password")
-
-            entered_code = st.text_input(
-                "Reset Code",
-                placeholder="Enter 6-digit code",
-                key="entered_reset_code",
-            )
-            new_password = st.text_input(
-                "New Password",
-                type="password",
-                key="new_password",
-            )
-            confirm_new_password = st.text_input(
-                "Confirm New Password",
-                type="password",
-                key="confirm_new_password",
-            )
-
-            if st.button(
-                "🔐 Reset Password",
-                key="reset_password_button",
-                use_container_width=True,
-                type="primary",
-            ):
-                if not entered_code:
-                    st.error("Please enter the reset code.")
-                elif not new_password:
-                    st.error("Please enter a new password.")
-                elif new_password != confirm_new_password:
-                    st.error("Passwords do not match.")
-                else:
-                    success, message = reset_password(
-                        st.session_state.reset_email,
-                        entered_code,
-                        new_password,
-                    )
-                    if success:
-                        st.success("✅ Password reset successfully! You can now login with your new password.")
-                        st.session_state.pop("reset_code_generated", None)
-                        st.session_state.pop("dev_reset_code", None)
-                        st.session_state.pop("reset_email", None)
-                    else:
-                        st.error(message)
-
 
 if not st.session_state.authenticated:
     show_authentication()
     st.stop()
-
-# ------------------------------------------------------------
-# Background RAG warm-up
-# ------------------------------------------------------------
-# Start loading the semantic embedding model after authentication,
-# without blocking the login page or dashboard rendering. The first
-# RAG question will reuse the same cached model if warm-up finishes.
-if not st.session_state.get("rag_warmup_started", False):
-    st.session_state.rag_warmup_started = True
-
-    def _warmup_rag_model():
-        try:
-            from src.rag_engine import get_embedding_model
-            get_embedding_model()
-        except Exception:
-            pass
-
-    import threading
-    threading.Thread(target=_warmup_rag_model, daemon=True).start()
-
-# Heavy analytics/visualization modules are loaded only after authentication.
-# This keeps the login/register screen fast.
-import plotly.graph_objects as go
-import plotly.express as px
-from src.ml_expense_prediction import get_prediction
-from src.anomaly_detection import get_anomalies
 
 
 # ============================================================
@@ -781,179 +842,13 @@ from src.anomaly_detection import get_anomalies
 # ============================================================
 
 CURRENT_USER_ID = int(st.session_state.user_id)
+
 set_current_user(CURRENT_USER_ID)
 
-def get_connection():
-    return get_user_connection(CURRENT_USER_ID)
-
-initialize_user_database(CURRENT_USER_ID, load_demo=True)
-
-
-
-def rebalance_demo_expenses_once():
-    """One-time demo-data adjustment so recorded expenses are below income.
-
-    This preserves every transaction, category, date, description and payment method;
-    it only scales existing expense amounts so the current demo totals produce a
-    positive savings position. A database marker prevents the adjustment from
-    running again on every Streamlit rerun.
-    """
-    target_expenses = 102714.10
-    connection = get_connection()
-    try:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS app_meta (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-            """
-        )
-
-        already_done = connection.execute(
-            "SELECT value FROM app_meta WHERE key = ?",
-            ("positive_demo_expenses_v1",),
-        ).fetchone()
-
-        if already_done:
-            return
-
-        current_total = connection.execute(
-            "SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE LOWER(type) = 'expense'"
-        ).fetchone()[0]
-
-        if current_total <= target_expenses:
-            connection.execute(
-                "INSERT INTO app_meta (key, value) VALUES (?, ?)",
-                ("positive_demo_expenses_v1", "not_needed"),
-            )
-            connection.commit()
-            return
-
-        factor = target_expenses / float(current_total)
-        connection.execute(
-            """
-            UPDATE transactions
-            SET amount = ROUND(amount * ?, 2)
-            WHERE LOWER(type) = 'expense'
-            """,
-            (factor,),
-        )
-
-        # Correct rounding drift so the total is exactly the target amount.
-        new_total = connection.execute(
-            "SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE LOWER(type) = 'expense'"
-        ).fetchone()[0]
-        difference = round(target_expenses - float(new_total), 2)
-
-        if difference != 0:
-            last_expense = connection.execute(
-                """
-                SELECT id FROM transactions
-                WHERE LOWER(type) = 'expense'
-                ORDER BY id DESC
-                LIMIT 1
-                """
-            ).fetchone()
-            if last_expense:
-                connection.execute(
-                    "UPDATE transactions SET amount = ROUND(amount + ?, 2) WHERE id = ?",
-                    (difference, last_expense[0]),
-                )
-
-        connection.execute(
-            "INSERT INTO app_meta (key, value) VALUES (?, ?)",
-            ("positive_demo_expenses_v1", f"adjusted_to_{target_expenses:.2f}"),
-        )
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
-
-rebalance_demo_expenses_once()
-
-
-def distribute_demo_income_across_months_once():
-    """Spread the existing demo income across May-September 2026 once.
-
-    The total income is preserved; only the timing and descriptions of the
-    demo income records are changed so monthly analysis shows income in each
-    month from May through September.
-    """
-    connection = get_connection()
-    marker_key = "demo_income_may_sep_v1"
-    try:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS app_meta (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-            """
-        )
-
-        if connection.execute(
-            "SELECT 1 FROM app_meta WHERE key = ?", (marker_key,)
-        ).fetchone():
-            return
-
-        rows = connection.execute(
-            "SELECT id, date, amount FROM transactions WHERE LOWER(type) = 'income' ORDER BY id"
-        ).fetchall()
-
-        if not rows:
-            return
-
-        total_income = round(sum(float(row[2]) for row in rows), 2)
-        if total_income <= 0:
-            return
-
-        # Preserve the current total income exactly while distributing it.
-        target_amounts = [20000.00, 23000.00, 25000.00, 32000.00, 30000.00]
-        target_total = round(sum(target_amounts), 2)
-        scale = total_income / target_total
-        target_amounts = [round(value * scale, 2) for value in target_amounts]
-        target_amounts[-1] = round(total_income - sum(target_amounts[:-1]), 2)
-
-        months = [
-            ("2026-05-15", "May Salary"),
-            ("2026-06-15", "June Salary"),
-            ("2026-07-15", "July Salary"),
-            ("2026-08-15", "August Salary"),
-            ("2026-09-15", "September Salary"),
-        ]
-
-        # Use the first existing income row for May and remove the remaining
-        # income rows; then create the five monthly demo income records.
-        connection.execute(
-            "DELETE FROM transactions WHERE LOWER(type) = 'income'"
-        )
-
-        for (date_value, description), amount in zip(months, target_amounts):
-            connection.execute(
-                """
-                INSERT INTO transactions
-                (date, type, category, description, amount, payment_method)
-                VALUES (?, 'Income', 'Salary', ?, ?, 'Bank Transfer')
-                """,
-                (date_value, description, amount),
-            )
-
-        connection.execute(
-            "INSERT INTO app_meta (key, value) VALUES (?, ?)",
-            (marker_key, f"distributed_total_{total_income:.2f}"),
-        )
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
-
-
-distribute_demo_income_across_months_once()
+initialize_user_database(
+    CURRENT_USER_ID,
+    load_demo=True
+)
 
 # ============================================================
 # DATABASE HELPERS
@@ -1057,6 +952,10 @@ def rebalance_demo_budgets_if_all_over():
 # Run once when the current development database has every active category over budget.
 rebalance_demo_budgets_if_all_over()
 
+
+# Run demo adjustments only against the authenticated user database.
+rebalance_demo_expenses_once()
+distribute_demo_income_across_months_once()
 
 def add_transaction(
     transaction_date,
@@ -1173,182 +1072,67 @@ except Exception as exc:
 # ============================================================
 
 def detect_chat_intent(question):
-    """Detect the user's Finance Chat intent using deterministic keyword rules."""
+    """Robust local intent detection for common Finance Chat questions."""
     text = str(question).strip().lower()
 
-    # General overview questions
     if any(term in text for term in [
-        "overview",
-        "summarize my finances",
-        "summary of my finances",
-        "financial overview",
-        "financial situation",
-        "how am i doing financially",
-        "give me an overview",
-        "show me an overview",
-    ]):
-        return "general"
-
-    # Advice questions
-    if any(term in text for term in [
-        "what should i do",
-        "how can i improve",
-        "improve my finances",
-        "improve my financial",
-        "financial advice",
-        "give me advice",
-        "advise me",
-        "recommend something",
-        "recommendation",
-        "how should i manage my money",
-        "how can i save more",
-    ]):
-        return "advice"
-
-    # Savings-health questions must come before generic income/expense rules.
-    if any(term in text for term in [
-        "am i saving enough",
-        "is my savings enough",
-        "are my savings enough",
-        "saving enough",
-        "savings rate",
-        "saving rate",
-        "how much did i save",
-        "how much have i saved",
-        "my savings",
-        "how much savings",
-    ]):
-        return "savings"
-
-    # Savings projection questions
-    if any(term in text for term in [
-        "how much can i save next month",
-        "how much will i save next month",
-        "how much could i save next month",
-        "projected savings",
-        "savings projection",
-        "savings forecast",
-        "future savings",
-        "next month savings",
-        "next month's savings",
-    ]):
-        return "savings_projection"
-
-    # Expense-analysis questions
-    if any(term in text for term in [
-        "why are my expenses high",
-        "why is my spending high",
-        "why are my expenses so high",
-        "why is my spending so high",
-        "what is driving my expenses",
-        "what drives my expenses",
-        "main contributors to my expenses",
-        "main expense drivers",
-        "why do i spend so much",
-        "why am i spending so much",
-    ]):
-        return "expense_analysis"
-
-    # ML prediction questions
-    if any(term in text for term in [
-        "predict",
-        "prediction",
-        "forecast expense",
-        "next expense",
-        "future expense",
-        "expected expense",
+        "predict", "prediction", "forecast", "next expense",
+        "future expense", "expected expense",
     ]):
         return "prediction"
 
-    # Anomaly detection questions
     if any(term in text for term in [
-        "anomaly",
-        "unusual spending",
-        "unusual transaction",
+        "anomaly", "unusual spending", "unusual transaction",
         "abnormal spending",
     ]):
         return "anomaly"
 
-    # Income questions
     if any(term in text for term in [
-        "income",
-        "salary",
-        "earn",
-        "earned",
-        "make",
-        "made",
+        "savings rate", "saving rate",
+    ]):
+        return "savings"
+
+    if any(term in text for term in [
+        "how much did i save", "how much have i saved",
+        "my savings", "how much savings",
+    ]):
+        return "savings"
+
+    if any(term in text for term in [
+        "income", "salary", "earn", "earned", "make", "made",
         "received",
     ]):
         return "income"
 
-    # Expense/category questions
     if any(term in text for term in [
-        "expense",
-        "expenses",
-        "spending",
-        "spent",
-        "spend",
+        "expense", "expenses", "spending", "spent",
     ]):
         if any(term in text for term in [
-            "biggest",
-            "highest",
-            "top",
-            "most",
-            "category",
-            "where am i spending",
-            "spending the most",
-            "should i reduce",
-            "which category should i reduce",
-            "reduce my spending",
+            "biggest", "highest", "top", "most", "category",
         ]):
             return "category"
-
         return "expenses"
 
     return "general"
 
 
-
 def answer_chat_question(question, df):
-    """Answer Finance Chat questions using local analytics first, then the LLM."""
+    """Answer common Finance Chat questions directly from current SQLite data."""
     text = str(question).strip().lower()
-
     if df is None or df.empty:
         return "There is no financial transaction data available."
 
     work = df.copy()
-    work["type_clean"] = (
-        work["type"].astype(str).str.strip().str.lower()
-    )
-    work["amount"] = pd.to_numeric(
-        work["amount"],
-        errors="coerce",
-    ).fillna(0.0)
+    work["type_clean"] = work["type"].astype(str).str.strip().str.lower()
+    work["amount"] = pd.to_numeric(work["amount"], errors="coerce").fillna(0.0)
 
-    income = float(
-        work.loc[
-            work["type_clean"] == "income",
-            "amount",
-        ].sum()
-    )
-
-    expenses_df = work[
-        work["type_clean"] == "expense"
-    ].copy()
-
+    income = float(work.loc[work["type_clean"] == "income", "amount"].sum())
+    expenses_df = work[work["type_clean"] == "expense"].copy()
     expenses = float(expenses_df["amount"].sum())
     savings = income - expenses
-    savings_rate = (
-        savings / income * 100
-        if income > 0
-        else 0.0
-    )
+    savings_rate = (savings / income * 100) if income > 0 else 0.0
 
     intent = detect_chat_intent(question)
-
-    # --------------------------------------------------------
-    # Basic deterministic financial answers
-    # --------------------------------------------------------
 
     if intent == "income":
         return f"Your total income is ₹{income:,.2f}."
@@ -1356,338 +1140,40 @@ def answer_chat_question(question, df):
     if intent == "expenses":
         return f"Your total expenses are ₹{expenses:,.2f}."
 
-    # --------------------------------------------------------
-    # Savings health
-    # --------------------------------------------------------
-
     if intent == "savings":
         if "rate" in text:
-            return f"📈 Your savings rate is {savings_rate:.2f}%."
-
-        if any(term in text for term in [
-            "am i saving enough",
-            "is my savings enough",
-            "are my savings enough",
-            "saving enough",
-        ]):
-            if savings_rate >= 30:
-                assessment = (
-                    "Your recorded savings rate is relatively high. "
-                    "You are retaining a substantial portion of your "
-                    "recorded income."
-                )
-            elif savings_rate >= 20:
-                assessment = (
-                    "Your recorded savings rate shows that you are "
-                    "retaining a meaningful portion of your income. "
-                    "You can still review your largest expense "
-                    "categories if you want to save more."
-                )
-            elif savings_rate >= 10:
-                assessment = (
-                    "Your recorded savings rate is positive, but there "
-                    "may be room to increase savings by reviewing "
-                    "discretionary expenses."
-                )
-            else:
-                assessment = (
-                    "Your recorded savings rate is low. Reviewing your "
-                    "largest expense categories may help you increase "
-                    "the amount you save."
-                )
-
-            return (
-                "### 💰 Savings Health\n\n"
-                "| Metric | Value |\n"
-                "|---|---:|\n"
-                f"| 💵 Recorded income | ₹{income:,.2f} |\n"
-                f"| 💸 Recorded expenses | ₹{expenses:,.2f} |\n"
-                f"| 💰 Net savings | ₹{savings:,.2f} |\n"
-                f"| 📈 Savings rate | {savings_rate:.1f}% |\n\n"
-                f"**FinanceAI insight:** {assessment}"
-            )
-
-        return (
-            "### 💰 Savings Summary\n\n"
-            "| Metric | Value |\n"
-            "|---|---:|\n"
-            f"| 💰 Net savings | ₹{savings:,.2f} |\n"
-            f"| 📈 Savings rate | {savings_rate:.2f}% |"
-        )
-
-    # --------------------------------------------------------
-    # Savings projection
-    # --------------------------------------------------------
-
-    if intent == "savings_projection":
-        monthly = work.copy()
-        monthly["date_clean"] = pd.to_datetime(
-            monthly["date"],
-            errors="coerce",
-        )
-        monthly = monthly.dropna(subset=["date_clean"])
-
-        if monthly.empty:
-            return (
-                "I need valid transaction dates to estimate "
-                "next month's savings."
-            )
-
-        monthly["month"] = (
-            monthly["date_clean"]
-            .dt.to_period("M")
-            .astype(str)
-        )
-
-        monthly_income = (
-            monthly[monthly["type_clean"] == "income"]
-            .groupby("month")["amount"]
-            .sum()
-        )
-
-        monthly_expenses = (
-            monthly[monthly["type_clean"] == "expense"]
-            .groupby("month")["amount"]
-            .sum()
-        )
-
-        months = sorted(
-            set(monthly_income.index)
-            | set(monthly_expenses.index)
-        )
-
-        if not months:
-            return (
-                "There is not enough monthly transaction data "
-                "to estimate next month's savings."
-            )
-
-        average_monthly_income = (
-            float(monthly_income.reindex(months, fill_value=0).mean())
-        )
-        average_monthly_expenses = (
-            float(monthly_expenses.reindex(months, fill_value=0).mean())
-        )
-        projected_savings = (
-            average_monthly_income - average_monthly_expenses
-        )
-
-        return (
-            "### 🔮 Next-Month Savings Projection\n\n"
-            "| Metric | Estimated Value |\n"
-            "|---|---:|\n"
-            f"| 💵 Average monthly income | ₹{average_monthly_income:,.2f} |\n"
-            f"| 💸 Average monthly expenses | ₹{average_monthly_expenses:,.2f} |\n"
-            f"| 💰 Estimated monthly savings | ₹{projected_savings:,.2f} |\n\n"
-            "> This is a simple historical-average projection, not a "
-            "guarantee of future income or expenses."
-        )
-
-    # --------------------------------------------------------
-    # Expense analysis
-    # --------------------------------------------------------
-
-    if intent == "expense_analysis":
-        if expenses_df.empty:
-            return "There are no expense transactions available for analysis."
-
-        category_spending = (
-            expenses_df
-            .groupby("category")["amount"]
-            .sum()
-            .sort_values(ascending=False)
-        )
-
-        total_expenses = float(category_spending.sum())
-
-        if total_expenses <= 0:
-            return "There is no positive expense amount available for analysis."
-
-        top_categories = category_spending.head(3)
-
-        lines = []
-        for category, amount in top_categories.items():
-            percentage = float(amount) / total_expenses * 100
-            lines.append(
-                f"• **{category}** — ₹{float(amount):,.2f} "
-                f"({percentage:.1f}%)"
-            )
-
-        return (
-            "### 📊 Expense Analysis\n\n"
-            "| Category | Amount | Share of expenses |\n"
-            "|---|---:|---:|\n"
-            + "\n".join(
-                f"| {category} | ₹{float(amount):,.2f} | "
-                f"{float(amount) / total_expenses * 100:.1f}% |"
-                for category, amount in top_categories.items()
-            )
-            + "\n\n"
-            f"**Total recorded expenses:** ₹{total_expenses:,.2f}\n\n"
-            "These categories explain where most of your recorded "
-            "spending is concentrated. The data shows the main "
-            "contributors, but it cannot by itself determine the "
-            "personal reasons behind the spending."
-        )
-
-    # --------------------------------------------------------
-    # Category spending
-    # --------------------------------------------------------
+            return f"Your savings rate is {savings_rate:.2f}%."
+        return f"Your savings are ₹{savings:,.2f}, with a savings rate of {savings_rate:.2f}%."
 
     if intent == "category":
         if expenses_df.empty:
             return "There are no expense transactions available."
-
-        category_spending = (
-            expenses_df
-            .groupby("category")["amount"]
-            .sum()
-            .sort_values(ascending=False)
-        )
-
-        if any(term in text for term in [
-            "biggest",
-            "highest",
-            "top",
-            "most",
-            "where am i spending",
-            "spending the most",
-            "should i reduce",
-            "which category should i reduce",
-            "reduce my spending",
-        ]):
+        category_spending = expenses_df.groupby("category")["amount"].sum().sort_values(ascending=False)
+        if "biggest" in text or "highest" in text or "top" in text or "most" in text:
             category = str(category_spending.index[0])
             amount = float(category_spending.iloc[0])
-            percentage = (
-                amount / expenses * 100
-                if expenses > 0
-                else 0.0
-            )
-
-            return (
-                "### 💡 Highest Spending Category\n\n"
-                "| Metric | Value |\n"
-                "|---|---:|\n"
-                f"| 📊 Category | **{category}** |\n"
-                f"| 💸 Amount | ₹{amount:,.2f} |\n"
-                f"| 📈 Share of expenses | {percentage:.1f}% |\n\n"
-                "This is the first category you could review if you "
-                "want to reduce spending."
-            )
-
-        return (
-            "### 📊 Spending by Category\n\n"
-            "| Category | Amount |\n"
-            "|---|---:|\n"
-            + "\n".join(
-                f"| {category} | ₹{float(amount):,.2f} |"
-                for category, amount in category_spending.items()
-            )
-        )
-
-    # --------------------------------------------------------
-    # ML prediction
-    # --------------------------------------------------------
+            return f"Your biggest expense category is {category} with ₹{amount:,.2f}."
+        lines = [f"- {category}: ₹{amount:,.2f}" for category, amount in category_spending.items()]
+        return "Here is your spending by category:\n\n" + "\n".join(lines)
 
     if intent == "prediction":
         try:
             prediction = get_prediction()
-            predicted = float(
-                prediction.get(
-                    "predicted_expense",
-                    prediction.get("prediction", 0),
-                )
-            )
-
-            return (
-                f"Your predicted next expense is "
-                f"approximately ₹{predicted:,.2f}."
-            )
+            predicted = float(prediction.get("predicted_expense", prediction.get("prediction", 0)))
+            return f"Your predicted next expense is approximately ₹{predicted:,.2f}."
         except Exception:
             return "Expense prediction is currently unavailable."
-
-    # --------------------------------------------------------
-    # Anomaly detection
-    # --------------------------------------------------------
 
     if intent == "anomaly":
         try:
             anomalies = get_anomalies()
-            count = (
-                len(anomalies)
-                if anomalies is not None
-                else 0
-            )
-
-            return (
-                f"I detected {count} unusual expense "
-                f"transaction(s) using the anomaly detection model."
-            )
+            count = len(anomalies) if anomalies is not None else 0
+            return f"I detected {count} unusual expense transaction(s) using the anomaly detection model."
         except Exception:
             return "Anomaly detection results are currently unavailable."
 
-    # --------------------------------------------------------
-    # General questions -> local semantic RAG
-    # --------------------------------------------------------
-
-    if intent == "general":
-        try:
-            # Load semantic RAG only when the user actually asks a
-            # knowledge-base question. This avoids loading
-            # SentenceTransformer/Transformers during login.
-            from src.rag_engine import retrieve_context
-
-            rag_context = retrieve_context(
-                question,
-                top_k=3,
-            )
-
-            # Keep only semantically relevant RAG chunks.
-            # RAG returns chunks separated by "---" and formats
-            # metadata as **Relevance:** 0.xxx.
-            if rag_context != "No relevant knowledge-base context was found.":
-                import re
-                sections = re.split(r"\n\s*---\s*\n", rag_context)
-                filtered_sections = []
-
-                for section in sections:
-                    match = re.search(
-                        r"\*{0,2}Relevance:\*{0,2}\s*([0-9.]+)",
-                        section,
-                        flags=re.IGNORECASE,
-                    )
-                    if match and float(match.group(1)) >= 0.40:
-                        filtered_sections.append(section.strip())
-
-                if filtered_sections:
-                    rag_context = "\n\n---\n\n".join(filtered_sections)
-                else:
-                    rag_context = "No relevant knowledge-base context was found."
-
-            if rag_context != "No relevant knowledge-base context was found.":
-                return (
-                    "📚 **FinanceAI Knowledge Base**\n\n"
-                    "Here is relevant information from the local "
-                    "FinanceAI knowledge base:\n\n"
-                    f"{rag_context}\n\n"
-                    "ℹ️ This answer is based on the local FinanceAI "
-                    "knowledge base."
-                )
-        except Exception:
-            pass
-
-    # --------------------------------------------------------
-    # General/advice fallback -> local/mock/real LLM
-    # --------------------------------------------------------
-
-    try:
-        return answer_with_llm(
-            question,
-            df,
-        )
-    except Exception:
-        return module_answer_question(question)
-
+    # Preserve the existing module fallback for unsupported/general questions.
+    return module_answer_question(question)
 
 
 # ============================================================
@@ -1703,37 +1189,19 @@ st.sidebar.markdown(
     """,
     unsafe_allow_html=True,
 )
-
-
 st.sidebar.markdown(
-    f"""
-<div style="background:#101C2D;border:1px solid #26374D;border-radius:14px;padding:12px;margin:4px 0 12px;">
-<div style="font-size:10px;color:#94A3B8;font-weight:700;letter-spacing:.08em;">SIGNED IN AS</div>
-<div style="font-size:14px;font-weight:800;color:#F8FAFC;margin-top:4px;">👤 {st.session_state.user_name}</div>
-<div style="font-size:11px;color:#94A3B8;margin-top:3px;word-break:break-word;">{st.session_state.user_email}</div>
-</div>
-""",
-    unsafe_allow_html=True,
+    f"""<div style="background:#101C2D;border:1px solid #26374D;border-radius:14px;padding:12px;margin:4px 0 16px;">
+    <div style="font-size:11px;color:#94A3B8;">SIGNED IN AS</div>
+    <div style="font-size:14px;font-weight:800;color:#F8FAFC;margin-top:3px;">{st.session_state.user_name}</div>
+    <div style="font-size:11px;color:#94A3B8;margin-top:2px;">{st.session_state.user_email}</div>
+    </div>""", unsafe_allow_html=True
 )
 
-if st.sidebar.button(
-    "🚪 Logout",
-    use_container_width=True,
-    key="logout_button",
-):
-    clear_current_user()
-    for key in [
-        "authenticated",
-        "user_id",
-        "user_name",
-        "user_email",
-        "chat_history",
-        "reset_code_generated",
-        "dev_reset_code",
-        "reset_email",
-    ]:
+if st.sidebar.button("🚪 Logout", use_container_width=True, key="logout_button"):
+    for key in ["authenticated", "user_id", "user_name", "user_email", "chat_history"]:
         st.session_state.pop(key, None)
     st.rerun()
+
 st.sidebar.markdown('<div class="sidebar-section">NAVIGATION</div>', unsafe_allow_html=True)
 
 page = st.sidebar.radio(
@@ -3269,12 +2737,9 @@ Start a conversation with your financial assistant.
         "expenses": "💸 Total Expenses",
         "savings": "💰 Savings",
         "category": "📊 Category Spending",
-        "expense_analysis": "📊 Expense Analysis",
-        "savings_projection": "🔮 Savings Projection",
         "prediction": "🔮 Expense Prediction",
         "anomaly": "🚨 Anomaly Detection",
         "comparison": "⚖️ Prediction Comparison",
-        "advice": "💡 Financial Advice",
         "general": "🧠 General Financial Question",
     }
 
@@ -3546,4 +3011,3 @@ elif page == "🚨 Anomaly Detection":
 
     except Exception as exc:
         st.error(f"Unable to run anomaly detection: {exc}")
-

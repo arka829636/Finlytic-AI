@@ -1,11 +1,25 @@
 import os
+from pathlib import Path
+
 from dotenv import load_dotenv
 
-load_dotenv()
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6")
+load_dotenv(PROJECT_ROOT / ".env")
 
-# Keep this True while developing without API credits.
-# Change to false only when you have API credits and want live LLM calls.
-MOCK_LLM = os.getenv("MOCK_LLM", "true").lower() == "true"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+
+OPENAI_MODEL = os.getenv(
+    "OPENAI_MODEL",
+    "gpt-5.6"
+).strip()
+
+MOCK_LLM = os.getenv(
+    "MOCK_LLM",
+    "true"
+).strip().lower() == "true"
+
+
+def is_llm_configured() -> bool:
+    """Return True when live LLM configuration is available."""
+    return bool(OPENAI_API_KEY)

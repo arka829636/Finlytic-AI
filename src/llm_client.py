@@ -1,134 +1,227 @@
-import re
+from __future__ import annotations
 
-from openai import OpenAI
+import pandas as pd
 
-from src.config import OPENAI_API_KEY, OPENAI_MODEL, MOCK_LLM
+from src.config import (
+    OPENAI_API_KEY,
+    OPENAI_MODEL,
+    MOCK_LLM,
+    is_llm_configured,
+)
 
-
-def _money(prompt: str, label: str) -> float:
-    """Extract a financial amount from the prepared summary."""
-    pattern = rf"{re.escape(label)}:\s*₹(-?[\d,]+(?:\.\d+)?)"
-    match = re.search(pattern, prompt)
-
-    if not match:
-        return 0.0
-
-    return float(match.group(1).replace(",", ""))
-
-
-def _percent(prompt: str, label: str) -> float:
-    pattern = rf"{re.escape(label)}:\s*(-?[\d,]+(?:\.\d+)?)%"
-    match = re.search(pattern, prompt)
-
-    if not match:
-        return 0.0
-
-    return float(match.group(1).replace(",", ""))
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
 
 
-def _category(prompt: str, label: str) -> str:
-    pattern = rf"{re.escape(label)}:\s*(.+)"
-    match = re.search(pattern, prompt)
+def llm_available() -> bool:
+    """Return True when either mock mode or live LLM mode is available."""
+    if MOCK_LLM:
+        return True
 
-    if not match:
-        return "None"
-
-    return match.group(1).strip()
+    return bool(is_llm_configured() and OpenAI is not None)
 
 
-def _mock_response(prompt: str) -> str:
-    """
-    Generate a realistic local development response from the
-    financial summary supplied by finance_chat.py.
+def _financial_context(df: pd.DataFrame) -> str:
+    """Create a safe financial summary from the logged-in user's data."""
 
-    No external API call is made in mock mode.
-    """
-    income = _money(prompt, "Total income")
-    expenses = _money(prompt, "Total expenses")
-    savings = _money(prompt, "Savings")
-    savings_rate = _percent(prompt, "Savings rate")
-    highest_category = _category(prompt, "Highest spending category")
-    highest_category_amount = _money(prompt, "Highest category spending")
+    if df is None or df.empty:
+        return "No financial transaction data is currently available."
 
-    if income == 0 and expenses == 0:
-        return (
-            "I don't have enough financial data to generate a useful "
-            "summary yet."
-        )
+    work = df.copy()
 
-    if savings < 0:
-        health = (
-            "Your expenses are currently higher than your income, "
-            "so your cash flow is under pressure."
-        )
-        action = (
-            f"Your highest spending category is {highest_category} "
-            f"at ₹{highest_category_amount:,.2f}. Reviewing this category "
-            "could be a good starting point for reducing expenses."
-        )
-    elif savings_rate < 10:
-        health = (
-            "You are saving money, but your current savings rate is relatively low."
-        )
-        action = (
-            f"Your highest spending category is {highest_category} "
-            f"at ₹{highest_category_amount:,.2f}. Monitoring this category "
-            "may help increase your savings."
-        )
-    elif savings_rate < 20:
-        health = (
-            "You have a positive savings position, with room to improve "
-            "your savings rate."
-        )
-        action = (
-            f"Your largest expense category is {highest_category} "
-            f"at ₹{highest_category_amount:,.2f}. Keeping it under control "
-            "could improve your savings."
-        )
-    else:
-        health = "You have a healthy positive savings position."
-        action = (
-            f"Your largest expense category is {highest_category} "
-            f"at ₹{highest_category_amount:,.2f}. Continue monitoring it "
-            "to maintain your current financial position."
-        )
+    work["type"] = (
+        work["type"]
+        .astype(str)
+        .str.strip()
+        .str.lower()
+    )
+
+    work["amount"] = pd.to_numeric(
+        work["amount"],
+        errors="coerce"
+    ).fillna(0)
+
+    income = float(
+        work.loc[
+            work["type"] == "income",
+            "amount"
+        ].sum()
+    )
+
+    expenses = float(
+        work.loc[
+            work["type"] == "expense",
+            "amount"
+        ].sum()
+    )
+
+    savings = income - expenses
+
+    savings_rate = (
+        savings / income * 100
+        if income
+        else 0.0
+    )
+
+    expense_rows = work[
+        work["type"] == "expense"
+    ]
+
+    category = (
+        expense_rows
+        .groupby("category")["amount"]
+        .sum()
+        .sort_values(ascending=False)
+        .head(5)
+        if not expense_rows.empty
+        else pd.Series(dtype=float)
+    )
+
+    category_text = ", ".join(
+        f"{name}: ₹{amount:,.2f}"
+        for name, amount in category.items()
+    )
+
+    if not category_text:
+        category_text = "No category-level expense data."
 
     return (
-        f"**Financial Summary**\n\n"
-        f"- Income: ₹{income:,.2f}\n"
-        f"- Expenses: ₹{expenses:,.2f}\n"
-        f"- Savings: ₹{savings:,.2f}\n"
-        f"- Savings rate: {savings_rate:.2f}%\n\n"
-        f"**Insight:** {health}\n\n"
-        f"**Recommendation:** {action}"
+    f"💵 Total income: ₹{income:,.2f}\n"
+    f"💸 Total expenses: ₹{expenses:,.2f}\n"
+    f"💰 Net savings: ₹{savings:,.2f}\n"
+    f"📈 Savings rate: {savings_rate:.1f}%\n\n"
+    f"📊 Top expense categories:\n"
+    f"{category_text}\n\n"
+    f"🧾 Transaction count: {len(work)}"
+)
+
+def _mock_response(
+    question: str,
+    transactions_df: pd.DataFrame
+) -> str:
+    """Local FinanceAI response used while MOCK_LLM=true."""
+
+    context = _financial_context(transactions_df)
+    text = str(question).strip().lower()
+
+    # Financial overview
+    if any(term in text for term in [
+        "overview",
+        "summarize",
+        "summary",
+        "financial situation",
+        "how am i doing",
+    ]):
+        return (
+            "📊 **Financial Overview**\n\n"
+            "Here is a summary of your current financial activity:\n\n"
+            f"{context}\n\n"
+            "💡 **Insight**\n\n"
+            "Your financial data contains both income and expense "
+            "activity. Keep monitoring your largest expense categories "
+            "and maintain a healthy savings rate.\n\n"
+            "🧪 *Development mode: Mock LLM response.*"
+        )
+
+    # Financial advice
+    if any(term in text for term in [
+        "advice",
+        "advise",
+        "recommend",
+        "recommendation",
+        "what should i do",
+    ]):
+        return (
+            "🤖 **FinanceAI Recommendation**\n\n"
+            f"{context}\n\n"
+            "### Suggested Actions\n\n"
+            "• Monitor your highest spending categories.\n"
+            "• Review recurring expenses regularly.\n"
+            "• Compare actual spending with your budget.\n"
+            "• Maintain an emergency savings buffer.\n\n"
+            "🧪 *Development mode: Mock LLM response.*"
+        )
+
+    # General questions
+    return (
+        "🤖 **FinanceAI**\n\n"
+        "Based on your current financial data:\n\n"
+        f"{context}\n\n"
+        f"**Your question:** {question}\n\n"
+        "🧪 *Development mode: Mock LLM response. "
+        "Live LLM generation is disabled because `MOCK_LLM=true`.*"
     )
 
 
-def ask_llm(prompt: str) -> str:
-    """Send a prompt to the LLM or use local mock mode."""
+def answer_with_llm(
+    question: str,
+    transactions_df: pd.DataFrame
+) -> str:
 
     if MOCK_LLM:
-        return _mock_response(prompt)
+        return _mock_response(
+            question,
+            transactions_df
+        )
 
     if not OPENAI_API_KEY:
-        return (
-            "The live LLM is unavailable because OPENAI_API_KEY is not "
-            "configured. Enable MOCK_LLM=true for local development."
+        raise RuntimeError(
+            "LLM is not configured. "
+            "Add OPENAI_API_KEY to .env."
         )
 
-    try:
-        client = OpenAI(api_key=OPENAI_API_KEY)
-
-        response = client.responses.create(
-            model=OPENAI_MODEL,
-            input=prompt
+    if OpenAI is None:
+        raise RuntimeError(
+            "The OpenAI package is not installed."
         )
 
-        return response.output_text
+    context = _financial_context(
+        transactions_df
+    )
 
-    except Exception as exc:
-        return (
-            "The live LLM request could not be completed. "
-            "The application is still running in fallback mode.\n\n"
-            f"Error type: {type(exc).__name__}"
-        )
+    instructions = (
+        "You are FinanceAI, a personal finance assistant "
+        "inside a student portfolio project. "
+
+        "Use only the supplied financial summary as "
+        "factual financial data. "
+
+        "Do not invent transactions, balances, "
+        "categories, or numbers. "
+
+        "Explain calculations clearly when useful. "
+
+        "Do not present yourself as a licensed "
+        "financial advisor. "
+
+        "For investment, tax, legal, credit, or other "
+        "high-stakes financial decisions, provide "
+        "general educational information and recommend "
+        "consulting a qualified professional. "
+
+        "If the question requires transaction-level "
+        "information that is not included in the "
+        "supplied summary, say that the current version "
+        "cannot retrieve that detail yet."
+    )
+
+    prompt = (
+        f"Financial summary:\n"
+        f"{context}\n\n"
+        f"User question:\n"
+        f"{question}"
+    )
+
+    client = OpenAI(
+        api_key=OPENAI_API_KEY
+    )
+
+    response = client.responses.create(
+        model=OPENAI_MODEL,
+        instructions=instructions,
+        input=prompt,
+    )
+
+    return response.output_text.strip()

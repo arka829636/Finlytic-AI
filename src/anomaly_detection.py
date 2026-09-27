@@ -1,9 +1,9 @@
-import sqlite3
+
 import pandas as pd
 from sklearn.ensemble import IsolationForest
 
 
-DB_PATH = "data/finance.db"
+from src.database import get_connection
 
 
 # ============================================================
@@ -12,7 +12,7 @@ DB_PATH = "data/finance.db"
 
 def get_expense_data():
 
-    connection = sqlite3.connect(DB_PATH)
+    connection = get_connection()
 
     query = """
         SELECT
